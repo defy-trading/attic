@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::timeout::TimeoutConfig;
+use aws_sdk_s3::config::StalledStreamProtectionConfig;
 use aws_sdk_s3::{
     config::Builder as S3ConfigBuilder,
     config::{Credentials, Region},
@@ -106,6 +107,18 @@ impl S3Backend {
                 .read_timeout(Duration::from_secs(15))
                 .build(),
         );
+
+        // The SDK's stalled-stream protection (on by default since
+        // BehaviorVersion 2024/2025) aborts a response body that delivers
+        // 0 B/s for its grace period (~5 s). merge_chunks prefetches up to 16
+        // chunk bodies and drains them one after another, so under load a
+        // prefetched body legitimately sits unread for longer than that — and
+        // the SDK kills it: "minimum throughput was specified at 1 B/s, but
+        // throughput of 0 B/s was observed" (4.6k such retries in one Ray
+        // wave on 2026-09-03). Every one of those was a truncated NAR before
+        // the resume logic existed. Idle bodies are bounded by our own
+        // CHUNK_READ_IDLE_TIMEOUT in api/binary_cache.rs instead.
+        builder = builder.stalled_stream_protection(StalledStreamProtectionConfig::disabled());
 
         if let Some(credentials) = &config.credentials {
             builder = builder.credentials_provider(Credentials::new(
