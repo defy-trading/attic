@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
+use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::{
     config::Builder as S3ConfigBuilder,
     config::{Credentials, Region},
@@ -94,6 +95,17 @@ impl S3Backend {
     async fn config_builder(config: &S3StorageConfig) -> ServerResult<S3ConfigBuilder> {
         let shared_config = aws_config::load_defaults(BehaviorVersion::v2025_01_17()).await;
         let mut builder = S3ConfigBuilder::from(&shared_config);
+
+        // A hung GetObject is otherwise invisible: no error, no metric
+        // (atticd_oss_request_duration only wraps send()). Bound connect and
+        // time-to-first-byte here; stalls mid-body are caught per read in
+        // api/binary_cache.rs (CHUNK_READ_IDLE_TIMEOUT).
+        builder = builder.timeout_config(
+            TimeoutConfig::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .read_timeout(Duration::from_secs(15))
+                .build(),
+        );
 
         if let Some(credentials) = &config.credentials {
             builder = builder.credentials_provider(Credentials::new(

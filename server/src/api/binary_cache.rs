@@ -25,7 +25,7 @@ use futures::stream::{BoxStream, StreamExt as _};
 use futures::TryStreamExt as _;
 use serde::Serialize;
 use tokio::io::AsyncRead;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_util::io::ReaderStream;
 use tracing::instrument;
 
@@ -48,6 +48,18 @@ const CHUNK_STREAM_MAX_ATTEMPTS: usize = 5;
 /// Hard stop for a single chunk, so a body that keeps dying after a byte or two
 /// can't keep a NAR stream alive forever.
 const CHUNK_STREAM_MAX_TOTAL_ATTEMPTS: usize = 20;
+
+/// Idle limit for one read of a chunk body. A stalled OSS response yields no
+/// error, so without this the NAR stream simply hangs until the client gives
+/// up (nix: stalled-download-timeout, 300 s by default). Under fleet load
+/// ~0.5 % of streams stalled that way, and a realise of ~900 paths collected
+/// several of them — which is how runtime-env setup ran past its 600 s
+/// budget. OSS read p99 is ~0.25 s; 15 s is far outside the tail.
+const CHUNK_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Same guard for (re)opening a chunk body: a GetObject whose headers never
+/// arrive would otherwise block the reassembly forever.
+const CHUNK_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Nix cache information.
 ///
@@ -229,13 +241,28 @@ fn resumable_chunk_stream(
             let reader = if let Some(reader) = opened.take() {
                 reader
             } else {
-                match storage.stream_file_db_from(&remote_file, offset).await {
+                let opened_reader = match timeout(
+                    CHUNK_OPEN_TIMEOUT,
+                    storage.stream_file_db_from(&remote_file, offset),
+                )
+                .await
+                {
+                    Ok(result) => result.map_err(io_error),
+                    Err(_) => Err(IoError::new(
+                        IoErrorKind::TimedOut,
+                        format!(
+                            "reopening chunk at offset {} timed out after {:?}",
+                            offset, CHUNK_OPEN_TIMEOUT
+                        ),
+                    )),
+                };
+                match opened_reader {
                     Ok(reader) => reader,
                     Err(e) => {
                         if attempt >= CHUNK_STREAM_MAX_ATTEMPTS
                             || total_attempts >= CHUNK_STREAM_MAX_TOTAL_ATTEMPTS
                         {
-                            Err::<(), IoError>(io_error(e))?;
+                            Err::<(), IoError>(e)?;
                         } else {
                             tracing::warn!(
                                 remote_file_id = %remote_file_id,
@@ -258,8 +285,26 @@ fn resumable_chunk_stream(
 
             let mut body = ReaderStream::new(reader);
             let mut failure = None;
+            let mut stalled = false;
 
-            while let Some(item) = body.next().await {
+            loop {
+                let next = match timeout(CHUNK_READ_IDLE_TIMEOUT, body.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        stalled = true;
+                        failure = Some(IoError::new(
+                            IoErrorKind::TimedOut,
+                            format!(
+                                "no data for {:?} at offset {}",
+                                CHUNK_READ_IDLE_TIMEOUT, offset
+                            ),
+                        ));
+                        break;
+                    }
+                };
+                let Some(item) = next else {
+                    break;
+                };
                 match item {
                     Ok(bytes) => {
                         offset += bytes.len() as u64;
@@ -309,9 +354,10 @@ fn resumable_chunk_stream(
                     error = %error_chain(&e),
                     "Chunk body failed, resuming from offset",
                 );
+                let reason: &'static str = if stalled { "stall" } else { "body" };
                 metrics::counter!(
                     "atticd_chunk_stream_retries_total",
-                    "reason" => "body",
+                    "reason" => reason,
                 )
                 .increment(1);
                 sleep(chunk_retry_backoff(attempt)).await;
