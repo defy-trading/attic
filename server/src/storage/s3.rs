@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
+use aws_sdk_s3::config::timeout::TimeoutConfig;
+use aws_sdk_s3::config::StalledStreamProtectionConfig;
 use aws_sdk_s3::{
     config::Builder as S3ConfigBuilder,
     config::{Credentials, Region},
@@ -94,6 +96,29 @@ impl S3Backend {
     async fn config_builder(config: &S3StorageConfig) -> ServerResult<S3ConfigBuilder> {
         let shared_config = aws_config::load_defaults(BehaviorVersion::v2025_01_17()).await;
         let mut builder = S3ConfigBuilder::from(&shared_config);
+
+        // A hung GetObject is otherwise invisible: no error, no metric
+        // (atticd_oss_request_duration only wraps send()). Bound connect and
+        // time-to-first-byte here; stalls mid-body are caught per read in
+        // api/binary_cache.rs (CHUNK_READ_IDLE_TIMEOUT).
+        builder = builder.timeout_config(
+            TimeoutConfig::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .read_timeout(Duration::from_secs(15))
+                .build(),
+        );
+
+        // The SDK's stalled-stream protection (on by default since
+        // BehaviorVersion 2024/2025) aborts a response body that delivers
+        // 0 B/s for its grace period (~5 s). merge_chunks prefetches up to 16
+        // chunk bodies and drains them one after another, so under load a
+        // prefetched body legitimately sits unread for longer than that — and
+        // the SDK kills it: "minimum throughput was specified at 1 B/s, but
+        // throughput of 0 B/s was observed" (4.6k such retries in one Ray
+        // wave on 2026-09-03). Every one of those was a truncated NAR before
+        // the resume logic existed. Idle bodies are bounded by our own
+        // CHUNK_READ_IDLE_TIMEOUT in api/binary_cache.rs instead.
+        builder = builder.stalled_stream_protection(StalledStreamProtectionConfig::disabled());
 
         if let Some(credentials) = &config.credentials {
             builder = builder.credentials_provider(Credentials::new(
@@ -407,6 +432,32 @@ impl StorageBackend for S3Backend {
         let req = client.get_object().bucket(&file.bucket).key(&file.key);
 
         self.get_download(req, prefer_stream).await
+    }
+
+    async fn stream_file_db_from(
+        &self,
+        file: &RemoteFile,
+        offset: u64,
+    ) -> ServerResult<Box<dyn AsyncRead + Unpin + Send>> {
+        let (client, file) = self.get_client_from_db_ref(file).await?;
+
+        let mut req = client.get_object().bucket(&file.bucket).key(&file.key);
+        if offset > 0 {
+            req = req.range(format!("bytes={}-", offset));
+        }
+
+        let start = Instant::now();
+        let result = req.send().await;
+        let status = if result.is_ok() { "ok" } else { "err" };
+        metrics::histogram!(
+            "atticd_oss_request_duration_seconds",
+            "op" => "get_object",
+            "status" => status,
+        )
+        .record(start.elapsed().as_secs_f64());
+        let output = result.map_err(ServerError::storage_error)?;
+
+        Ok(Box::new(output.body.into_async_read()))
     }
 
     async fn make_db_reference(&self, name: String) -> ServerResult<RemoteFile> {
